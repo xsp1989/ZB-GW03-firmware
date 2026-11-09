@@ -46,5 +46,5 @@ runs:
         fi
         echo "Installing: ${PKG}"
         python -m pip install --upgrade pip
-        python -m pip install --upgrade "${PKG}" littlefs-python
+        python -m pip install --upgrade --retries 5 --timeout 60 "${PKG}" littlefs-python
         pio --version
