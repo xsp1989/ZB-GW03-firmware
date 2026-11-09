@@ -1,0 +1,326 @@
+name: Build & Release Tasmota for ZB-GW03
+
+# This repository stores no Tasmota source code and no build output.
+# The workflow:
+#   1) checks arendst/Tasmota for a new release (or takes a tag from the input)
+#   2) clones that tag
+#   3) builds every ZB-GW03 language environment with the overrides in tasmota/
+#   4) collects the firmware and publishes a release
+on:
+  schedule:
+    # check upstream for new versions every day at 01:00 UTC
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+    inputs:
+      tasmota_ref:
+        description: 'Tasmota tag (e.g. v16.0.0); leave empty to use the latest upstream release'
+        required: false
+        default: ''
+      force:
+        description: 'Rebuild even if a release for this version already exists'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: zb-gw03-tasmota-build
+  cancel-in-progress: false
+
+env:
+  TASMOTA_REPO: arendst/Tasmota
+  PYTHONUTF8: '1'
+  PYTHONIOENCODING: utf-8
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Resolve the target version and collect the build environments
+  # ---------------------------------------------------------------------------
+  prepare:
+    name: Resolve version & environments
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      skip: ${{ steps.resolve.outputs.skip }}
+      envs: ${{ steps.envs.outputs.envs }}
+      count: ${{ steps.envs.outputs.count }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve target Tasmota tag
+        id: resolve
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_REF: ${{ inputs.tasmota_ref }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+
+          TAG="${INPUT_REF:-}"
+          if [ -z "$TAG" ]; then
+            TAG="$(gh api "repos/${TASMOTA_REPO}/releases/latest" --jq '.tag_name')"
+            echo "Latest upstream release: ${TAG}"
+          fi
+          [[ "$TAG" == v* ]] || TAG="v${TAG}"
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+          if [ "${FORCE:-false}" != "true" ] && gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::notice::Release ${TAG} already exists, skipping build (use the force option to rebuild)"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Collect build environments from platformio_override.ini
+        id: envs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import re
+          import sys
+
+          envs = []
+          with open("tasmota/platformio_override.ini", encoding="utf-8", errors="ignore") as fh:
+              for line in fh:
+                  m = re.match(r"\s*\[env:(tasmota32-ZB-GW03-[A-Za-z0-9]+)\]\s*$", line)
+                  if m:
+                      envs.append(m.group(1))
+
+          if not envs:
+              sys.exit("no tasmota32-ZB-GW03-* environment found in platformio_override.ini")
+
+          print("envs=" + json.dumps(envs))
+          print("count=" + str(len(envs)))
+          print(f"Found {len(envs)} build environments: {', '.join(envs)}", file=sys.stderr)
+          PY
+
+  # ---------------------------------------------------------------------------
+  # 2. Build the safeboot image first
+  #    Tasmota needs a safeboot image to create .factory.bin. Building it here from
+  #    the same tag avoids downloading it from ota.tasmota.com during the build.
+  # ---------------------------------------------------------------------------
+  safeboot:
+    name: Build safeboot image
+    needs: prepare
+    if: needs.prepare.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Cache PlatformIO & pip
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: pio-${{ runner.os }}-${{ needs.prepare.outputs.tag }}-${{ hashFiles('tasmota/platformio_override.ini') }}
+          restore-keys: |
+            pio-${{ runner.os }}-${{ needs.prepare.outputs.tag }}-
+            pio-${{ runner.os }}-
+
+      - name: Prepare Tasmota
+        uses: ./.github/actions/prepare-tasmota
+        with:
+          tag: ${{ needs.prepare.outputs.tag }}
+          repo: ${{ env.TASMOTA_REPO }}
+
+      - name: Build tasmota32-safeboot
+        working-directory: Tasmota
+        run: pio run --environment tasmota32-safeboot
+
+      - name: Upload safeboot image
+        uses: actions/upload-artifact@v4
+        with:
+          name: safeboot
+          # single file upload, so the artifact root is tasmota32-safeboot.bin
+          path: Tasmota/build_output/firmware/tasmota32-safeboot.bin
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # 3. Matrix build
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build ${{ matrix.env }}
+    needs: [prepare, safeboot]
+    if: needs.prepare.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      # limit parallelism to avoid upstream rate limits and download storms
+      max-parallel: 8
+      matrix:
+        env: ${{ fromJSON(needs.prepare.outputs.envs) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Cache PlatformIO & pip
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: pio-${{ runner.os }}-${{ needs.prepare.outputs.tag }}-${{ hashFiles('tasmota/platformio_override.ini') }}
+          restore-keys: |
+            pio-${{ runner.os }}-${{ needs.prepare.outputs.tag }}-
+            pio-${{ runner.os }}-
+
+      - name: Prepare Tasmota
+        uses: ./.github/actions/prepare-tasmota
+        with:
+          tag: ${{ needs.prepare.outputs.tag }}
+          repo: ${{ env.TASMOTA_REPO }}
+
+      # post_esp32.py prefers variants/tasmota/tasmota32-safeboot.bin and does not
+      # download anything when that file exists and is a valid ESP image.
+      - name: Provide self-built safeboot image
+        uses: actions/download-artifact@v4
+        with:
+          name: safeboot
+          path: Tasmota/variants/tasmota
+
+      # also stage it in firmware/firmware/ for the GitHub Actions copy branch upstream
+      - name: Stage safeboot for factory merge
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p Tasmota/firmware/firmware
+          cp Tasmota/variants/tasmota/tasmota32-safeboot.bin Tasmota/firmware/firmware/
+
+      - name: Build firmware
+        working-directory: Tasmota
+        run: pio run --environment "${{ matrix.env }}"
+
+      - name: Collect build output
+        shell: bash
+        run: |
+          set -euo pipefail
+          ENV="${{ matrix.env }}"
+          VER="${{ needs.prepare.outputs.version }}"
+          SRC="Tasmota/build_output/firmware"
+          mkdir -p dist
+          shopt -s nullglob
+
+          for f in "$SRC/$ENV.bin" "$SRC/$ENV.bin.gz" "$SRC/$ENV.factory.bin"; do
+            base="$(basename "$f")"
+            suffix="${base#"$ENV"}"
+            cp "$f" "dist/${ENV}-${VER}${suffix}"
+          done
+
+          if [ -z "$(ls -A dist)" ]; then
+            echo "::warning::No file found at $SRC/$ENV.*, falling back to .pio/build"
+            cp "Tasmota/.pio/build/$ENV/firmware.bin" "dist/${ENV}-${VER}.bin"
+          fi
+
+          ls -lh dist
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.env }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # 4. Collect artifacts and publish the release
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publish release
+    needs: [prepare, build]
+    if: needs.prepare.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd artifacts
+          sha256sum * > /tmp/SHA256SUMS.txt
+          mv /tmp/SHA256SUMS.txt ./SHA256SUMS.txt
+          ls -lh
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          ENV_COUNT: ${{ needs.prepare.outputs.count }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          NOTES="$RUNNER_TEMP/release-notes.md"
+
+          {
+            echo "## ZB-GW03 · Tasmota ${VERSION}"
+            echo
+            echo "Firmware compiled from upstream [Tasmota ${TAG}](https://github.com/${TASMOTA_REPO}/tree/${TAG}) — ${ENV_COUNT} language variants."
+            echo
+            echo "Source code: https://github.com/${TASMOTA_REPO}/tree/${TAG}"
+            echo
+            echo "### Files"
+            echo
+            echo "| File | Purpose |"
+            echo "| --- | --- |"
+            echo "| tasmota32-ZB-GW03-XX.bin | Firmware for OTA update or esptool. XX is the language code (EN English / CN Simplified Chinese / TW Traditional Chinese ...) |"
+            echo "| tasmota32-ZB-GW03-XX.factory.bin | Merged full-flash image for the first serial flash (write at 0x0) |"
+            echo "| tasmota32-ZB-GW03-XX.bin.gz | Gzipped firmware, only present when produced by the Tasmota build scripts |"
+            echo "| SHA256SUMS.txt | SHA-256 checksums |"
+            echo
+            echo "### Flashing"
+            echo
+            echo "1. OTA: Tasmota Web UI -> Firmware Upgrade -> select tasmota32-ZB-GW03-XX.bin"
+            echo "2. Serial: esptool.py --chip esp32 --baud 460800 write_flash 0x0 tasmota32-ZB-GW03-XX.factory.bin"
+            echo
+            echo "The module template, GPIO layout, Zigbee (EZSP) and Ethernet (LAN8720, clock output on GPIO17) are preset at compile time via USER_TEMPLATE, so no manual configuration is required after flashing."
+            echo
+            echo "> Tasmota is licensed under GPL-3.0. Full source code is available at the upstream link above."
+          } > "$NOTES"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists, overwriting assets and notes (force mode)"
+            gh release upload "$TAG" artifacts/* --clobber
+            gh release edit "$TAG" \
+              --title "Tasmota ${VERSION} for ZB-GW03" \
+              --notes-file "$NOTES"
+          else
+            gh release create "$TAG" artifacts/* \
+              --title "Tasmota ${VERSION} for ZB-GW03" \
+              --notes-file "$NOTES"
+          fi
+
+          gh release view "$TAG" --json url --jq '.url'

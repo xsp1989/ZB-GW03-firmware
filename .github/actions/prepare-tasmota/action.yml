@@ -1,0 +1,50 @@
+name: Prepare Tasmota build
+description: Clone the requested Tasmota tag, apply the ZB-GW03 overrides and install pioarduino
+
+inputs:
+  tag:
+    description: Tasmota tag (e.g. v16.0.0)
+    required: true
+  repo:
+    description: Tasmota repository
+    required: false
+    default: arendst/Tasmota
+
+runs:
+  using: composite
+  steps:
+    - name: Clone Tasmota ${{ inputs.tag }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        rm -rf Tasmota
+        git clone --depth 1 --branch "${{ inputs.tag }}" \
+          "https://github.com/${{ inputs.repo }}.git" Tasmota
+
+    - name: Apply ZB-GW03 overrides
+      shell: bash
+      run: |
+        set -euo pipefail
+        cp tasmota/platformio_override.ini Tasmota/platformio_override.ini
+        cp tasmota/user_config_override.h Tasmota/user_config_override.h
+
+    # ESP32 builds need pioarduino (the Tasmota/ESP32 fork of PlatformIO).
+    # The version pinned by the CI of the target Tasmota tag is preferred so that
+    # the build environment matches upstream.
+    - name: Install build tool
+      shell: bash
+      run: |
+        set -euo pipefail
+        PINNED="$(grep -hoE 'pioarduino==[0-9A-Za-z.]+' Tasmota/.github/workflows/*.y*ml 2>/dev/null \
+                   | head -n1 | cut -d= -f3 -s || true)"
+        if [ -n "${PINNED}" ]; then
+          PKG="pioarduino==${PINNED}"
+        elif grep -qs 'pioarduino' Tasmota/.github/workflows/*.y*ml 2>/dev/null; then
+          PKG="pioarduino"
+        else
+          PKG="platformio"
+        fi
+        echo "Installing: ${PKG}"
+        python -m pip install --upgrade pip
+        python -m pip install --upgrade "${PKG}" littlefs-python
+        pio --version
