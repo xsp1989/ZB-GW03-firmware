@@ -1,5 +1,5 @@
 name: Prepare Tasmota build
-description: Clone the requested Tasmota tag, apply the ZB-GW03 overrides and install pioarduino
+description: Clone the requested Tasmota tag, apply the ZB-GW03 overrides and set up PlatformIO Core
 
 inputs:
   tag:
@@ -28,23 +28,22 @@ runs:
         cp tasmota/platformio_override.ini Tasmota/platformio_override.ini
         cp tasmota/user_config_override.h Tasmota/user_config_override.h
 
-    # ESP32 builds need pioarduino (the Tasmota/ESP32 fork of PlatformIO).
-    # The version pinned by the CI of the target Tasmota tag is preferred so that
-    # the build environment matches upstream.
-    - name: Install build tool
+    # PlatformIO Core in its own virtual environment, exactly as described in
+    # https://tasmota.github.io/docs/Create-your-own-Firmware-Build-without-IDE/
+    #   virtualenv platformio-core && cd platformio-core && pip install -U platformio
+    # No version is pinned here: the newest released Core is installed, which is
+    # what the Tasmota ESP32 platform expects. `python -m venv` is used instead of
+    # the `virtualenv` package because it ships with the runner's Python.
+    # littlefs-python is required by Tasmota's pio-tools/post_esp32.py.
+    - name: Set up PlatformIO Core
       shell: bash
       run: |
         set -euo pipefail
-        PINNED="$(grep -hoE 'pioarduino==[0-9A-Za-z.]+' Tasmota/.github/workflows/*.y*ml 2>/dev/null \
-                   | head -n1 | cut -d= -f3 -s || true)"
-        if [ -n "${PINNED}" ]; then
-          PKG="pioarduino==${PINNED}"
-        elif grep -qs 'pioarduino' Tasmota/.github/workflows/*.y*ml 2>/dev/null; then
-          PKG="pioarduino"
-        else
-          PKG="platformio"
-        fi
-        echo "Installing: ${PKG}"
-        python -m pip install --upgrade pip
-        python -m pip install --upgrade --retries 5 --timeout 60 "${PKG}" littlefs-python
-        pio --version
+        CORE_ENV="${RUNNER_TEMP:-$HOME}/platformio-core"
+        rm -rf "${CORE_ENV}"
+        python -m venv "${CORE_ENV}"
+        echo "${CORE_ENV}/bin" >> "${GITHUB_PATH}"
+        "${CORE_ENV}/bin/python" -m pip install --upgrade --retries 5 --timeout 60 pip
+        "${CORE_ENV}/bin/python" -m pip install --upgrade --retries 5 --timeout 60 \
+          platformio littlefs-python
+        "${CORE_ENV}/bin/pio" --version

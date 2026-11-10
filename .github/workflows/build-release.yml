@@ -140,28 +140,12 @@ jobs:
           tag: ${{ needs.prepare.outputs.tag }}
           repo: ${{ env.TASMOTA_REPO }}
 
+      # build-env.sh retries transient download errors and repairs a PlatformIO
+      # Core inside ~/.platformio/penv that the platform itself rejects.
       - name: Build tasmota32-safeboot
         working-directory: Tasmota
         shell: bash
-        run: |
-          set -uo pipefail
-          # Large toolchain packages can hit transient 5xx / timeouts from GitHub;
-          # retry only for download errors, real compile errors fail immediately.
-          LOG="$RUNNER_TEMP/pio-safeboot.log"
-          for attempt in 1 2 3 4; do
-            if pio run --environment tasmota32-safeboot 2>&1 | tee "$LOG"; then
-              exit 0
-            fi
-            if grep -qiE 'PackageException|unrecognized status code|HTTP error|timed out|connection (reset|aborted)' "$LOG"; then
-              echo "::warning::Transient download error (attempt ${attempt}/4), retrying in $((attempt * 20))s"
-            else
-              echo "::error::Build failed with a non-transient error"
-              exit 1
-            fi
-            sleep $((attempt * 20))
-          done
-          echo "::error::tasmota32-safeboot build failed after 4 attempts"
-          exit 1
+        run: bash "${GITHUB_WORKSPACE}/.github/scripts/build-env.sh" tasmota32-safeboot "$RUNNER_TEMP/pio-safeboot.log"
 
       - name: Upload safeboot image
         uses: actions/upload-artifact@v4
@@ -232,25 +216,7 @@ jobs:
       - name: Build firmware
         working-directory: Tasmota
         shell: bash
-        run: |
-          set -uo pipefail
-          # Large toolchain packages can hit transient 5xx / timeouts from GitHub;
-          # retry only for download errors, real compile errors fail immediately.
-          LOG="$RUNNER_TEMP/pio-build.log"
-          for attempt in 1 2 3 4; do
-            if pio run --environment "${{ matrix.env }}" 2>&1 | tee "$LOG"; then
-              exit 0
-            fi
-            if grep -qiE 'PackageException|unrecognized status code|HTTP error|timed out|connection (reset|aborted)' "$LOG"; then
-              echo "::warning::Transient download error (attempt ${attempt}/4), retrying in $((attempt * 20))s"
-            else
-              echo "::error::Build failed with a non-transient error"
-              exit 1
-            fi
-            sleep $((attempt * 20))
-          done
-          echo "::error::Build failed after 4 attempts"
-          exit 1
+        run: bash "${GITHUB_WORKSPACE}/.github/scripts/build-env.sh" "${{ matrix.env }}" "$RUNNER_TEMP/pio-build.log"
 
       - name: Collect build output
         shell: bash
