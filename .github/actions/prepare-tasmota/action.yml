@@ -13,6 +13,41 @@ inputs:
 runs:
   using: composite
   steps:
+    # PlatformIO Core in its own virtual environment, following
+    # https://tasmota.github.io/docs/Create-your-own-Firmware-Build-without-IDE/
+    #   sudo yum install -y python python-virtualenv python-pip
+    #   sudo pip install --upgrade pip
+    #   virtualenv platformio-core
+    #   cd platformio-core
+    #   pip install -U platformio
+    # The runner is Ubuntu, so the yum packages are installed with the apt
+    # equivalents. littlefs-python is added because Tasmota's
+    # pio-tools/post_esp32.py imports it.
+    - name: Set up PlatformIO Core
+      shell: bash
+      run: |
+        set -eo pipefail
+
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq python3 python3-pip python3-virtualenv
+
+        # optional per the docs: the virtualenv gets its own pip upgraded below
+        sudo python3 -m pip install --upgrade pip --break-system-packages || true
+
+        cd "${RUNNER_TEMP:-$HOME}"
+        rm -rf platformio-core
+        # -p python3 keeps the interpreter pinned by actions/setup-python
+        virtualenv -p python3 platformio-core
+        cd platformio-core
+        . bin/activate
+
+        pip install -U pip
+        pip install -U platformio littlefs-python
+        pio --version
+
+        # keep the environment active for the following steps
+        echo "${VIRTUAL_ENV}/bin" >> "${GITHUB_PATH}"
+
     - name: Clone Tasmota ${{ inputs.tag }}
       shell: bash
       run: |
@@ -27,23 +62,3 @@ runs:
         set -euo pipefail
         cp tasmota/platformio_override.ini Tasmota/platformio_override.ini
         cp tasmota/user_config_override.h Tasmota/user_config_override.h
-
-    # PlatformIO Core in its own virtual environment, exactly as described in
-    # https://tasmota.github.io/docs/Create-your-own-Firmware-Build-without-IDE/
-    #   virtualenv platformio-core && cd platformio-core && pip install -U platformio
-    # No version is pinned here: the newest released Core is installed, which is
-    # what the Tasmota ESP32 platform expects. `python -m venv` is used instead of
-    # the `virtualenv` package because it ships with the runner's Python.
-    # littlefs-python is required by Tasmota's pio-tools/post_esp32.py.
-    - name: Set up PlatformIO Core
-      shell: bash
-      run: |
-        set -euo pipefail
-        CORE_ENV="${RUNNER_TEMP:-$HOME}/platformio-core"
-        rm -rf "${CORE_ENV}"
-        python -m venv "${CORE_ENV}"
-        echo "${CORE_ENV}/bin" >> "${GITHUB_PATH}"
-        "${CORE_ENV}/bin/python" -m pip install --upgrade --retries 5 --timeout 60 pip
-        "${CORE_ENV}/bin/python" -m pip install --upgrade --retries 5 --timeout 60 \
-          platformio littlefs-python
-        "${CORE_ENV}/bin/pio" --version
