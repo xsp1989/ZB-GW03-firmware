@@ -63,21 +63,30 @@ version_release() {
 # A post/dev/pre release sorts below the plain release it is derived from, e.g.
 # 6.2.0-post.1 < 6.2.0, which is exactly what PlatformIO's semantic-version
 # check does. So "6.2.0.post1" fails ">=6.2.0" while "6.2.1.post1" passes it.
+#
+# A requirement that already carries a pre-release marker (">=6.2.0-0", used by
+# the platform to accept post releases on purpose) accepts 6.2.0-post.1 as well.
 core_is_rejected() {
-  local ver="${1#v}" release suffix
+  local ver="${1#v}" required="${2#v}"
+  local release required_release suffix
 
   [ -n "${ver}" ] || return 0
   release="$(version_release "${ver}")"
-  [ -n "${release}" ] || return 0
+  required_release="$(version_release "${required}")"
+  [ -n "${release}" ] && [ -n "${required_release}" ] || return 0
 
   suffix="${ver#"${release}"}"
   suffix="${suffix#[._-]}"
 
   if [ -n "${suffix}" ]; then
-    version_gt "${release}" "$2" && return 1
+    if [ "${required}" != "${required_release}" ]; then
+      version_ge "${release}" "${required_release}" && return 1
+    else
+      version_gt "${release}" "${required_release}" && return 1
+    fi
     return 0
   fi
-  version_ge "${release}" "$2" && return 1
+  version_ge "${release}" "${required_release}" && return 1
   return 0
 }
 
@@ -94,7 +103,7 @@ needs_repair() {
 
 # installs the required Core release into the environment that owns <pio>
 repair_env() {
-  local bin dir dist
+  local bin dir dist release
   bin="$1"
   dir="$(cd "$(dirname "${bin}")" && pwd)" || return 1
   [ -x "${dir}/python" ] || return 1
@@ -108,24 +117,27 @@ PY
 )" || return 1
 
   # the plain release, never a post release: "6.2.0" satisfies ">=6.2.0",
-  # "6.2.0.post1" does not
-  echo "::warning::Installing ${dist}==${2} into ${dir}"
+  # "6.2.0.post1" does not. A requirement of ">=6.2.0-0" still installs 6.2.0.
+  release="$(version_release "$2")"
+  [ -n "${release}" ] || return 1
+  echo "::warning::Installing ${dist}==${release} into ${dir}"
   if [ -x "${dir}/uv" ]; then
-    "${dir}/uv" pip install -p "${dir}/python" "${dist}==${2}" || return 1
+    "${dir}/uv" pip install -p "${dir}/python" "${dist}==${release}" || return 1
   else
-    "${dir}/python" -m pip install "${dist}==${2}" || return 1
+    "${dir}/python" -m pip install "${dist}==${release}" || return 1
   fi
   "${dir}/pio" --version
 }
 
-# The Core version the installed platform requires, e.g. "6.2.0" out of
-# {"engines": {"platformio": ">=6.2.0-0"}}. Empty when the platform is not
-# installed yet, which is the case on a cold cache.
+# The Core version the installed platform requires, e.g. "6.2.0-0" out of
+# {"engines": {"platformio": ">=6.2.0-0"}} - the pre-release marker is kept,
+# it tells whether the platform accepts a post release. Empty when the platform
+# is not installed yet, which is the case on a cold cache.
 platform_requirement() {
   local required
   [ -f "${PLATFORM_MANIFEST}" ] || return 1
   required="$(sed -nE \
-    's/.*"platformio"[[:space:]]*:[[:space:]]*">=?[[:space:]]*v?([0-9]+(\.[0-9]+)*).*/\1/p' \
+    's/.*"platformio"[[:space:]]*:[[:space:]]*">=?[[:space:]]*v?([0-9][0-9A-Za-z._-]*).*/\1/p' \
     "${PLATFORM_MANIFEST}" | head -n1)"
   [ -n "${required}" ] || return 1
   printf '%s\n' "${required}"
