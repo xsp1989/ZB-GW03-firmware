@@ -226,16 +226,23 @@ jobs:
           VER="${{ needs.prepare.outputs.version }}"
           SRC="Tasmota/build_output/firmware"
           mkdir -p dist
-          shopt -s nullglob
 
+          # The file names are fixed strings, not globs, so every one of them has
+          # to be checked: Tasmota writes <env>.bin.gz for ESP32 only when
+          # "enable_esp32_gz" is set in the [tasmota] section, and a build that
+          # does not produce it must not fail the job.
           for f in "$SRC/$ENV.bin" "$SRC/$ENV.bin.gz" "$SRC/$ENV.factory.bin"; do
+            if [ ! -f "$f" ]; then
+              echo "::notice::$(basename "$f") was not produced by this build"
+              continue
+            fi
             base="$(basename "$f")"
             suffix="${base#"$ENV"}"
             cp "$f" "dist/${ENV}-${VER}${suffix}"
           done
 
-          if [ -z "$(ls -A dist)" ]; then
-            echo "::warning::No file found at $SRC/$ENV.*, falling back to .pio/build"
+          if [ ! -f "dist/${ENV}-${VER}.bin" ]; then
+            echo "::warning::No $SRC/$ENV.bin, falling back to .pio/build"
             cp "Tasmota/.pio/build/$ENV/firmware.bin" "dist/${ENV}-${VER}.bin"
           fi
 
